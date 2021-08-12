@@ -16,6 +16,8 @@
  */
 package site.ycsb.db.cloudspanner;
 
+import com.google.api.gax.retrying.RetrySettings;
+import com.google.api.gax.rpc.StatusCode.Code;
 import com.google.common.base.Joiner;
 import com.google.cloud.spanner.DatabaseId;
 import com.google.cloud.spanner.DatabaseClient;
@@ -32,6 +34,9 @@ import com.google.cloud.spanner.Statement;
 import com.google.cloud.spanner.Struct;
 import com.google.cloud.spanner.StructReader;
 import com.google.cloud.spanner.TimestampBound;
+import com.google.cloud.grpc.GcpManagedChannelOptions;
+import com.google.cloud.grpc.GcpManagedChannelOptions.GcpMetricsOptions;
+import com.google.cloud.grpc.GcpManagedChannelOptions.GcpResiliencyOptions;
 import site.ycsb.ByteIterator;
 import site.ycsb.Client;
 import site.ycsb.DB;
@@ -40,6 +45,7 @@ import site.ycsb.Status;
 import site.ycsb.StringByteIterator;
 import site.ycsb.workloads.CoreWorkload;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -50,6 +56,15 @@ import java.util.Vector;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.concurrent.TimeUnit;
+import org.threeten.bp.Duration;
+
+import io.opencensus.exporter.stats.stackdriver.StackdriverStatsExporter;
+import io.opencensus.implcore.common.MillisClock;
+import io.opencensus.metrics.DerivedLongGauge;
+import io.opencensus.metrics.MetricOptions;
+import io.opencensus.metrics.Metrics;
+import io.opencensus.implcore.metrics.DerivedLongGaugeImpl;
+import java.util.Collections;
 
 /**
  * YCSB Client for Google's Cloud Spanner.
@@ -152,6 +167,7 @@ public class CloudSpannerClient extends DB {
     }
     String numChannels = properties.getProperty(CloudSpannerProperties.NUM_CHANNELS);
     int numThreads = Integer.parseInt(properties.getProperty(Client.THREAD_COUNT_PROPERTY, "1"));
+
     SpannerOptions.Builder optionsBuilder = SpannerOptions.newBuilder()
         .setSessionPoolOption(SessionPoolOptions.newBuilder()
             .setMinSessions(numThreads)
@@ -167,6 +183,55 @@ public class CloudSpannerClient extends DB {
     if (numChannels != null) {
       optionsBuilder.setNumChannels(Integer.parseInt(numChannels));
     }
+
+    String runKind = properties.getProperty("runkind");
+
+    GcpMetricsOptions metricsOptions = GcpMetricsOptions.newBuilder()
+        .withMetricRegistry(Metrics.getMetricRegistry())
+        .build();
+
+    if (runKind.equals("gcp")) {
+      optionsBuilder.enableGrpcGcpExtension(GcpManagedChannelOptions.newBuilder()
+          .withMetricsOptions(metricsOptions)
+          .build());
+      LOGGER.log(Level.INFO, "ENABLED GCP WITHOUT IMPROVEMENTS");
+    }
+
+    if (runKind.equals("imp")) {
+      optionsBuilder.enableGrpcGcpExtension(GcpManagedChannelOptions.newBuilder()
+          .withMetricsOptions(metricsOptions)
+          .withResiliencyOptions(GcpResiliencyOptions.newBuilder()
+              .withUnresponsiveConnectionDetection(5000, 5)
+              .setNotReadyFallback(true)
+              .build())
+          .build());
+      LOGGER.log(Level.INFO, "ENABLED GCP WITH IMPROVEMENTS");
+    }
+
+    String timeoutStr = properties.getProperty("timeout");
+    final int timeout = Integer.parseInt(timeoutStr);
+    final RetrySettings retrySettings =
+        RetrySettings.newBuilder()
+            .setInitialRpcTimeout(Duration.ofMillis(timeout))
+            .setMaxRpcTimeout(Duration.ofMillis(timeout))
+            .setMaxAttempts(1)
+            .setTotalTimeout(Duration.ofMillis(timeout))
+            .build();
+
+    optionsBuilder
+        .getSpannerStubSettingsBuilder()
+        .executeStreamingSqlSettings()
+        .setRetryableCodes(Code.UNAVAILABLE)
+        .setRetrySettings(retrySettings);
+
+    optionsBuilder
+        .getSpannerStubSettingsBuilder()
+        .commitSettings()
+        .setRetryableCodes(Code.UNAVAILABLE)
+        .setRetrySettings(retrySettings);
+
+    LOGGER.log(Level.INFO, "SET TIMEOUT TO {0}ms", timeout);
+
     spanner = optionsBuilder.build().getService();
     Runtime.getRuntime().addShutdownHook(new Thread("spannerShutdown") {
         @Override
@@ -183,6 +248,35 @@ public class CloudSpannerClient extends DB {
       if (dbClient != null) {
         return;
       }
+      try {
+        // Enable OpenCensus exporters to export metrics to Stackdriver Monitoring.
+        // Exporters use Application Default Credentials to authenticate.
+        // See https://developers.google.com/identity/protocols/application-default-credentials
+        // for more details.
+        // The minimum reporting period for Stackdriver is 1 minute.
+
+        LOGGER.log(Level.INFO, "ADDING METRICS...");
+
+        final DerivedLongGauge gauge = Metrics.getMetricRegistry()
+            .addDerivedLongGauge("tmp_mr_test_metric",
+                MetricOptions.builder()
+                    .setUnit("1")
+                    .setDescription("Test MR metric")
+                    .build());
+
+        gauge.removeTimeSeries(Collections.emptyList());
+        gauge.createTimeSeries(Collections.emptyList(), this, cloudSpannerClient -> 345L);
+
+        ((DerivedLongGaugeImpl) gauge).getMetric(MillisClock.getInstance());
+
+        LOGGER.log(Level.INFO, "METRICS ENABLED!");
+
+        StackdriverStatsExporter.createAndRegister();
+        LOGGER.log(Level.INFO, "STACKDRIVER EXPORT ENABLED!");
+      } catch (IOException e) {
+        LOGGER.log(Level.SEVERE, "StackdriverStatsExporter.createAndRegister()", e);
+      }
+
       Properties properties = getProperties();
       String host = properties.getProperty(CloudSpannerProperties.HOST);
       String project = properties.getProperty(CloudSpannerProperties.PROJECT);

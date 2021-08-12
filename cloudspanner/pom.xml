@@ -59,6 +59,16 @@ LICENSE file.
       <artifactId>perfmark-traceviewer</artifactId>
       <version>0.23.0</version>
     </dependency>
+    <dependency>
+    <groupId>io.opencensus</groupId>
+      <artifactId>opencensus-impl</artifactId>
+      <version>0.28.0</version>
+    </dependency>
+    <dependency>
+      <groupId>io.opencensus</groupId>
+      <artifactId>opencensus-exporter-stats-stackdriver</artifactId>
+      <version>0.28.0</version>
+    </dependency>
 
   </dependencies>
 </project>
